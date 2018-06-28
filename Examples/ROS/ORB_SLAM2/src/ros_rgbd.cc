@@ -46,6 +46,26 @@
 #include <opencv2/highgui/highgui_c.h>
 #include <opencv2/highgui/highgui.hpp>
 #include <Converter.h>
+
+#include <stdio.h>
+#include <time.h>
+#include <stdlib.h>
+
+#include <Eigen/Dense>
+
+#ifndef DISABLE_FLANN
+#include <flann/flann.hpp>
+typedef flann::Index<flann::L2<double> > FLANN;
+typedef std::unique_ptr<FLANN> FLANN_;
+typedef flann::Matrix<double> flannMatT;
+typedef flann::Matrix<int> flannResultT;
+typedef std::unique_ptr<flannMatT> flannMatT_;
+#endif
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 //////////////////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -54,35 +74,84 @@
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////
 // parameters
-float scale_factor = 3;
-float resize_factor = 5;
-float cloud_max_x = 10;
-float cloud_min_x = -10.0;
-float cloud_max_z = 16;
-float cloud_min_z = -5;
+
+float scale_factor = 10;
+float resize_factor = 1;
+float cloud_max_x = 29;
+float cloud_min_x = -25;
+float cloud_max_z = 48;
+float cloud_min_z = -12;
 float free_thresh = 0.55;
-float occupied_thresh = 0.50;
+float occupied_thresh = 0.5;
+unsigned int use_local_counters = 1;
+int visit_thresh = 5;
+unsigned int use_gaussian_counters = 1;
+bool use_boundary_detection = 0;
+bool use_height_thresholding = 1;
+double normal_thresh_deg = 75.0;
+int canny_thresh = 350;
+
+
+
+
+// float scale_factor = 3;
+// float resize_factor = 5;
+// float cloud_max_x = 10;
+// float cloud_min_x = -10.0;
+// float cloud_max_z = 16;
+// float cloud_min_z = -5;
+// float free_thresh = 0.55;
+// float occupied_thresh = 0.50;
 float thresh_diff = 0.01;
-int visit_thresh = 0;
+// int visit_thresh = 0;
 float upper_left_x = -1.5;
 float upper_left_y = -2.5;
 const int resolution = 10;
-unsigned int use_local_counters = 0;
+// unsigned int use_local_counters = 0;
+
+// unsigned int use_gaussian_counters = 0;
+// bool use_boundary_detection = false;
+// bool use_height_thresholding = false;
+// int canny_thresh = 350;
+bool show_camera_location = true;
+unsigned int gaussian_kernel_size = 3;
+int cam_radius = 2;
+// no. of keyframes between successive goal messages that are published
+unsigned int goal_gap = 20;
+bool enable_goal_publishing = false;
+
+#ifndef DISABLE_FLANN
+// double normal_thresh_deg = 0;
+bool use_plane_normals = false;
+double normal_thresh_y_rad=0.0;
+std::vector<double> normal_angle_y;
+FLANN_ flann_index;
+#endif
+
 
 float grid_max_x, grid_min_x,grid_max_z, grid_min_z;
 cv::Mat global_occupied_counter, global_visit_counter;
 cv::Mat local_occupied_counter, local_visit_counter;
 cv::Mat local_map_pt_mask;
 cv::Mat grid_map, grid_map_int, grid_map_thresh, grid_map_thresh_resized;
+cv::Mat grid_map_rgb;
+cv::Mat gauss_kernel;
 float norm_factor_x, norm_factor_z;
+float norm_factor_x_us, norm_factor_z_us;
 int h, w;
 unsigned int n_kf_received;
 bool loop_closure_being_processed = false;
 ros::Publisher pub_grid_map;
 nav_msgs::OccupancyGrid grid_map_msg;
 
+Eigen::Matrix4d transform_mat;
+
 float kf_pos_x, kf_pos_z;
 int kf_pos_grid_x, kf_pos_grid_z;
+geometry_msgs::Point kf_location;
+geometry_msgs::Quaternion kf_orientation;
+unsigned int kf_id = 0;
+unsigned int init_pose_id = 0, goal_id = 0;
 
 
 bool pub_all_pts = false;
@@ -101,8 +170,6 @@ void kfCallback(const geometry_msgs::PoseStamped::ConstPtr& camera_pose);
 void saveMap(unsigned int id = 0);
 void ptCallback(const geometry_msgs::PoseArray::ConstPtr& pts_and_pose);
 void loopClosingCallback(const geometry_msgs::PoseArray::ConstPtr& all_kf_and_pts);
-void parseParams(int argc, char **argv);
-void printParams();
 void showGridMap(unsigned int id = 0);
 void getMixMax(const geometry_msgs::PoseArray::ConstPtr& pts_and_pose,
 	geometry_msgs::Point& min_pt, geometry_msgs::Point& max_pt);
@@ -185,11 +252,19 @@ int main(int argc, char **argv)
 	grid_map.create(h, w, CV_32FC1);
 	grid_map_thresh.create(h, w, CV_8UC1);
 	grid_map_thresh_resized.create(h*resize_factor, w*resize_factor, CV_8UC1);
+	grid_map_rgb.create(h*resize_factor, w*resize_factor, CV_8UC3);
 	printf("output_size: (%d, %d)\n", grid_map_thresh_resized.rows, grid_map_thresh_resized.cols);
 
 	local_occupied_counter.create(h, w, CV_32SC1);
 	local_visit_counter.create(h, w, CV_32SC1);
 	local_map_pt_mask.create(h, w, CV_8UC1);
+
+	gauss_kernel = cv::getGaussianKernel(gaussian_kernel_size, -1);
+
+
+	norm_factor_x_us = float(cloud_max_x - cloud_min_x - 1) / float(cloud_max_x - cloud_min_x);
+	norm_factor_z_us = float(cloud_max_z - cloud_min_z - 1) / float(cloud_max_z - cloud_min_z);
+
 
 	norm_factor_x = float(grid_res_x - 1) / float(grid_max_x - grid_min_x);
 	norm_factor_z = float(grid_res_z - 1) / float(grid_max_z - grid_min_z);
@@ -225,20 +300,21 @@ int main(int argc, char **argv)
 
     ros::spin();
 
+	printf("DEBUG-1\n");
     saveMap();
     // Stop all threads
     SLAM.Shutdown();
 
-    printf("DEBUG-1");
-
+    
+	printf("DEBUG-2\n");
     // Save camera trajectory
     SLAM.SaveKeyFrameTrajectoryTUM("KeyFrameTrajectory.txt");
-    printf("DEBUG-2");
+    printf("DEBUG-3\n");
 
     ros::shutdown();
-    printf("DEBUG-3");
+    printf("DEBUG-4\n");
     cv::destroyAllWindows();
-    printf("DEBUG-4");
+    printf("DEBUG-5\n");
 	
     return 0;
 }
@@ -288,25 +364,35 @@ void kfCallback(const geometry_msgs::PoseStamped::ConstPtr& camera_pose){
 		camera_pose->header.seq);
 }
 void saveMap(unsigned int id) {
-    printf("saving maps with id: %u\n", id);
-    time_t t = time(0);   // get time now
-    struct tm * now = localtime( & t );
-    char buffer [80];
-    strftime (buffer,80,"%y%m%d_%H%M%S",now);
+	try{
+		printf("saving maps with id: %d (debug)\n", id);
+		time_t rawtime;   // get time now
+		struct tm * timeinfo;
 
-	mkdir((string("results/")+string(buffer)).c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
-	//mkdir("results", S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
-	if (id > 0) {
-		cv::imwrite((string("results/") + string(buffer) + string("/grid_map_") + to_string(id) + string(".jpg")).c_str(), grid_map);
-		cv::imwrite((string("results/") + string(buffer) + string("/grid_map_thresh_") + to_string(id) + string(".jpg")).c_str(), grid_map_thresh);
-		cv::imwrite((string("results/") + string(buffer) + string("/grid_map_thresh_resized") + to_string(id) + string(".jpg")).c_str(), grid_map_thresh_resized);
+		time(&rawtime);
+		timeinfo = localtime (&rawtime);
+		char buffer [80];
+		strftime (buffer,80,"%y%m%d_%H%M%S",timeinfo);
+
+		// mkdir((string("/home/bkjung/ORB_SLAM2-gridmap/results/")+string(buffer)).c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+		system(("mkdir -p /home/bkjung/ORB_SLAM2-gridmap/results/"+string(buffer)).c_str());
+		printf("/home/bkjung/ORB_SLAM2-gridmap/results/%s\n", string(buffer).c_str());
+		//mkdir("results", S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+		if (id > 0) {
+			cv::imwrite(("/home/bkjung/ORB_SLAM2-gridmap/results/" + string(buffer) + "/grid_map_" + to_string(id) + ".jpg").c_str(), grid_map);
+			cv::imwrite(("/home/bkjung/ORB_SLAM2-gridmap/results/" + string(buffer) + "/grid_map_thresh_" + to_string(id) + ".jpg").c_str(), grid_map_thresh);
+			cv::imwrite(("/home/bkjung/ORB_SLAM2-gridmap/results/" + string(buffer) + "/grid_map_thresh_resized" + to_string(id) + ".jpg").c_str(), grid_map_thresh_resized);
+		}
+		else {
+			cv::imwrite(("/home/bkjung/ORB_SLAM2-gridmap/results/" + string(buffer) + "/grid_map.jpg").c_str(), grid_map);
+			cv::imwrite(("/home/bkjung/ORB_SLAM2-gridmap/results/" + string(buffer) + "/grid_map_thresh.jpg").c_str(), grid_map_thresh);
+			cv::imwrite(("/home/bkjung/ORB_SLAM2-gridmap/results/" + string(buffer) + "/grid_map_thresh_resized.jpg").c_str(), grid_map_thresh_resized);
+		}
+		printf("saved maps!!!\n");
 	}
-	else {
-		cv::imwrite((string("results/") + string(buffer) + string("/grid_map.jpg")).c_str(), grid_map);
-		cv::imwrite((string("results/") + string(buffer) + string("/grid_map_thresh.jpg")).c_str(), grid_map_thresh);
-		cv::imwrite((string("results/") + string(buffer) + string("/grid_map_thresh_resized.jpg")).c_str(), grid_map_thresh_resized);
+	catch (...) {
+		printf("error in saveMap\n");
 	}
-    printf("saved maps!!!");
 
 }
 void ptCallback(const geometry_msgs::PoseArray::ConstPtr& pts_and_pose){
@@ -365,24 +451,41 @@ void getMixMax(const geometry_msgs::PoseArray::ConstPtr& pts_and_pose,
 		if (curr_pt.z > max_pt.z) { max_pt.z = curr_pt.z; }
 	}
 }
-void processMapPt(const geometry_msgs::Point &curr_pt, cv::Mat &occupied, 
-	cv::Mat &visited, cv::Mat &pt_mask, int kf_pos_grid_x, int kf_pos_grid_z) {
+void processMapPt(const geometry_msgs::Point &curr_pt, cv::Mat &occupied, cv::Mat &visited, 
+	cv::Mat &pt_mask, int kf_pos_grid_x, int kf_pos_grid_z, unsigned int pt_id) {
 	float pt_pos_x = curr_pt.x*scale_factor;
 	float pt_pos_z = curr_pt.z*scale_factor;
 
 	int pt_pos_grid_x = int(floor((pt_pos_x - grid_min_x) * norm_factor_x));
 	int pt_pos_grid_z = int(floor((pt_pos_z - grid_min_z) * norm_factor_z));
 
-
 	if (pt_pos_grid_x < 0 || pt_pos_grid_x >= w)
 		return;
 
 	if (pt_pos_grid_z < 0 || pt_pos_grid_z >= h)
 		return;
-
-	// Increment the occupency account of the grid cell where map point is located
-	++occupied.at<int>(pt_pos_grid_z, pt_pos_grid_x);
-	pt_mask.at<uchar>(pt_pos_grid_z, pt_pos_grid_x) = 255;
+	bool is_ground_pt = false;
+	bool is_in_horizontal_plane = false;
+	if (use_height_thresholding){
+		float pt_pos_y = curr_pt.y*scale_factor;
+		Eigen::Vector4d transformed_point_location = transform_mat * Eigen::Vector4d(pt_pos_x, pt_pos_y, pt_pos_z, 1);
+		double transformed_point_height = transformed_point_location[1] / transformed_point_location[3];
+		is_ground_pt = transformed_point_height < 0;
+	}
+#ifndef DISABLE_FLANN
+	if (use_plane_normals) {
+		double normal_angle_y_rad = normal_angle_y[pt_id];
+		is_in_horizontal_plane = normal_angle_y_rad < normal_thresh_y_rad;
+	}
+#endif
+	if (is_ground_pt || is_in_horizontal_plane) {
+		++visited.at<float>(pt_pos_grid_z, pt_pos_grid_x);
+	}
+	else {
+		// Increment the occupency account of the grid cell where map point is located
+		++occupied.at<float>(pt_pos_grid_z, pt_pos_grid_x);
+		pt_mask.at<uchar>(pt_pos_grid_z, pt_pos_grid_x) = 255;
+	}	
 
 	//cout << "----------------------" << endl;
 	//cout << okf_pos_grid_x << " " << okf_pos_grid_y << endl;
@@ -409,10 +512,10 @@ void processMapPt(const geometry_msgs::Point &curr_pt, cv::Mat &occupied,
 	int ystep = (y0 < y1) ? 1 : -1;
 	for (int x = x0; x <= x1; ++x){
 		if (steep) {
-			++visited.at<int>(x, y);
+			++visited.at<float>(x, y);
 		}
 		else {
-			++visited.at<int>(y, x);
+			++visited.at<float>(y, x);
 		}
 		error = error + deltaerr;
 		if (error >= 0.5){
@@ -425,34 +528,91 @@ void processMapPt(const geometry_msgs::Point &curr_pt, cv::Mat &occupied,
 void processMapPts(const std::vector<geometry_msgs::Pose> &pts, unsigned int n_pts,
 	unsigned int start_id, int kf_pos_grid_x, int kf_pos_grid_z) {
 	unsigned int end_id = start_id + n_pts;
+#ifndef DISABLE_FLANN
+	if (use_plane_normals) {
+		cv::Mat cv_dataset(n_pts, 3, CV_64FC1);
+		for (unsigned int pt_id = start_id; pt_id < end_id; ++pt_id){
+			cv_dataset.at<double>(pt_id - start_id, 0) = pts[pt_id].position.x;
+			cv_dataset.at<double>(pt_id - start_id, 1) = pts[pt_id].position.y;
+			cv_dataset.at<double>(pt_id - start_id, 2) = pts[pt_id].position.z;
+		}
+		//printf("building FLANN index...\n");		
+		flann_index->buildIndex(flannMatT((double *)(cv_dataset.data), n_pts, 3));
+		normal_angle_y.resize(n_pts);
+		for (unsigned int pt_id = start_id; pt_id < end_id; ++pt_id){
+			double pt[3], dists[3];
+			pt[0] = pts[pt_id].position.x;
+			pt[1] = pts[pt_id].position.y;
+			pt[2] = pts[pt_id].position.z;
+
+			int results[3];
+			flannMatT flann_query(pt, 1, 3);
+			flannMatT flann_dists(dists, 1, 3);
+			flannResultT flann_result(results, 3, 1);
+			flann_index->knnSearch(flann_query, flann_result, flann_dists, 3, flann::SearchParams());
+			Eigen::Matrix3d nearest_pts;
+			//printf("Point %d: %f, %f, %f\n", pt_id - start_id, pt[0], pt[1], pt[2]);
+			for (unsigned int i = 0; i < 3; ++i){
+				nearest_pts(0, i) = cv_dataset.at<double>(results[i], 0);
+				nearest_pts(1, i) = cv_dataset.at<double>(results[i], 1);
+				nearest_pts(2, i) = cv_dataset.at<double>(results[i], 2);
+				//printf("Nearest Point %d: %f, %f, %f\n", results[i], nearest_pts(0, i), nearest_pts(1, i), nearest_pts(2, i));
+			}
+			Eigen::Vector3d centroid = nearest_pts.rowwise().mean();
+			//printf("centroid %f, %f, %f\n", centroid[0], centroid[1], centroid[2]);
+			Eigen::Matrix3d centered_pts = nearest_pts.colwise() - centroid;
+			Eigen::JacobiSVD<Eigen::Matrix3d> svd(centered_pts, Eigen::ComputeThinU | Eigen::ComputeThinV);
+			int n_cols = svd.matrixU().cols();
+			// left singular vector corresponding to the smallest singular value
+			Eigen::Vector3d normal_direction = svd.matrixU().col(n_cols - 1);
+			//printf("normal_direction %f, %f, %f\n", normal_direction[0], normal_direction[1], normal_direction[2]);
+			// angle to y axis
+			normal_angle_y[pt_id-start_id] = acos(normal_direction[1]);
+			if (normal_angle_y[pt_id - start_id ]> (M_PI / 2.0)) {
+				normal_angle_y[pt_id - start_id] = M_PI - normal_angle_y[pt_id - start_id];
+			}
+			//printf("normal angle: %f rad or %f deg\n", normal_angle_y[pt_id - start_id], normal_angle_y[pt_id - start_id]*180.0/M_PI);
+			//printf("\n\n");
+		}
+	}
+#endif
 	if (use_local_counters) {
 		local_map_pt_mask.setTo(0);
 		local_occupied_counter.setTo(0);
 		local_visit_counter.setTo(0);
 		for (unsigned int pt_id = start_id; pt_id < end_id; ++pt_id){
 			processMapPt(pts[pt_id].position, local_occupied_counter, local_visit_counter,
-				local_map_pt_mask, kf_pos_grid_x, kf_pos_grid_z);
+				local_map_pt_mask, kf_pos_grid_x, kf_pos_grid_z, pt_id - start_id);
 		}
 		for (int row = 0; row < h; ++row){
 			for (int col = 0; col < w; ++col){
 				if (local_map_pt_mask.at<uchar>(row, col) == 0) {
-					local_occupied_counter.at<int>(row, col) = 0;
+					local_occupied_counter.at<float>(row, col) = 0;
 				}
 				else {
-					local_occupied_counter.at<int>(row, col) = local_visit_counter.at<int>(row, col);
+					local_occupied_counter.at<float>(row, col) = local_visit_counter.at<float>(row, col);
 				}
 			}
 		}
+		if (use_gaussian_counters) {
+			cv::filter2D(local_occupied_counter, local_occupied_counter, CV_32F, gauss_kernel);
+			cv::filter2D(local_visit_counter, local_visit_counter, CV_32F, gauss_kernel);
+		}
 		global_occupied_counter += local_occupied_counter;
 		global_visit_counter += local_visit_counter;
+		//cout << "local_occupied_counter: \n" << local_occupied_counter << "\n";
+		//cout << "global_occupied_counter: \n" << global_occupied_counter << "\n";
+		//cout << "local_visit_counter: \n" << local_visit_counter << "\n";
+		//cout << "global_visit_counter: \n" << global_visit_counter << "\n";
 	}
 	else {
 		for (unsigned int pt_id = start_id; pt_id < end_id; ++pt_id){
 			processMapPt(pts[pt_id].position, global_occupied_counter, global_visit_counter,
-				local_map_pt_mask, kf_pos_grid_x, kf_pos_grid_z);
+				local_map_pt_mask, kf_pos_grid_x, kf_pos_grid_z, pt_id - start_id);
 		}
 	}
 }
+
 
 void updateGridMap(const geometry_msgs::PoseArray::ConstPtr& pts_and_pose){
 
@@ -465,8 +625,8 @@ void updateGridMap(const geometry_msgs::PoseArray::ConstPtr& pts_and_pose){
 
 	//printf("Received frame %u \n", pts_and_pose->header.seq);
 
-	const geometry_msgs::Point &kf_location = pts_and_pose->poses[0].position;
-	//const geometry_msgs::Quaternion &kf_orientation = pts_and_pose->poses[0].orientation;
+	kf_location = pts_and_pose->poses[0].position;
+	kf_orientation = pts_and_pose->poses[0].orientation;
 
 	kf_pos_x = kf_location.x*scale_factor;
 	kf_pos_z = kf_location.z*scale_factor;
@@ -479,7 +639,18 @@ void updateGridMap(const geometry_msgs::PoseArray::ConstPtr& pts_and_pose){
 
 	if (kf_pos_grid_z < 0 || kf_pos_grid_z >= h)
 		return;
+
 	++n_kf_received;
+
+	if (use_height_thresholding){
+		Eigen::Vector4d kf_orientation_eig(kf_orientation.w, kf_orientation.x, kf_orientation.y, kf_orientation.z);
+		kf_orientation_eig.array() /= kf_orientation_eig.norm();
+		Eigen::Matrix3d keyframe_rotation = Eigen::Quaterniond(kf_orientation_eig).toRotationMatrix();
+		Eigen::Vector3d keyframe_translation(kf_location.x*scale_factor, kf_location.y*scale_factor, kf_location.z*scale_factor);
+		transform_mat.setIdentity();
+		transform_mat.topLeftCorner<3, 3>() = keyframe_rotation.transpose();
+		transform_mat.topRightCorner<3, 1>() = (-keyframe_rotation.transpose() * keyframe_translation);
+	}
 	unsigned int n_pts = pts_and_pose->poses.size() - 1;
 	//printf("Processing key frame %u and %u points\n",n_kf_received, n_pts);
 	processMapPts(pts_and_pose->poses, n_pts, 1, kf_pos_grid_x, kf_pos_grid_z);
@@ -488,6 +659,7 @@ void updateGridMap(const geometry_msgs::PoseArray::ConstPtr& pts_and_pose){
 	//showGridMap(pts_and_pose->header.seq);
 	//cout << endl << "Grid map saved!" << endl;
 }
+
 
 void resetGridMap(const geometry_msgs::PoseArray::ConstPtr& all_kf_and_pts){
 	global_visit_counter.setTo(0);
@@ -804,3 +976,28 @@ void publish(ORB_SLAM2::System &SLAM, ros::Publisher &pub_pts_and_pose,
 		//pub_kf.publish(camera_pose);
 	}
 }
+
+
+void printParams() {
+	printf("Using params:\n");
+	printf("scale_factor: %f\n", scale_factor);
+	printf("resize_factor: %f\n", resize_factor);
+	printf("cloud_max: %f, %f\t cloud_min: %f, %f\n", cloud_max_x, cloud_max_z, cloud_min_x, cloud_min_z);
+	//printf("cloud_min: %f, %f\n", cloud_min_x, cloud_min_z);
+	printf("free_thresh: %f\n", free_thresh);
+	printf("occupied_thresh: %f\n", occupied_thresh);
+	printf("use_local_counters: %d\n", use_local_counters);
+	printf("visit_thresh: %d\n", visit_thresh);
+	printf("use_gaussian_counters: %d\n", use_gaussian_counters);
+	printf("use_boundary_detection: %d\n", use_boundary_detection);
+	printf("use_height_thresholding: %d\n", use_height_thresholding);
+#ifndef DISABLE_FLANN
+	printf("normal_thresh_deg: %f\n", normal_thresh_deg);
+#endif
+	printf("canny_thresh: %d\n", canny_thresh);
+	printf("enable_goal_publishing: %d\n", enable_goal_publishing);
+	printf("show_camera_location: %d\n", show_camera_location);
+	printf("gaussian_kernel_size: %d\n", gaussian_kernel_size);
+	printf("cam_radius: %d\n", cam_radius);
+}
+

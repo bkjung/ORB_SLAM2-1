@@ -227,8 +227,8 @@ int main(int argc, char **argv){
 	//ros::Subscriber sub_kf = nodeHandler.subscribe("camera_pose", 1000, kfCallback);
 	//ros::Subscriber sub = nodeHandler.subscribe("/camera/image_raw", 1, &ImageGrabber::GrabImage, &igb);
 
-	cv::namedWindow("grid_map_thresh_resized", CV_WINDOW_NORMAL);
-	cv::namedWindow("grid_map_msg", CV_WINDOW_NORMAL);
+	//cv::namedWindow("grid_map_thresh_resized", CV_WINDOW_NORMAL);
+	//cv::namedWindow("grid_map_msg", CV_WINDOW_NORMAL);
 
 	ros::spin();
 	ros::shutdown();
@@ -620,7 +620,7 @@ void updateGridMap(const geometry_msgs::PoseArray::ConstPtr& pts_and_pose){
 	processMapPts(pts_and_pose->poses, n_pts, 1, kf_pos_grid_x, kf_pos_grid_z);
 
 	getGridMap();
-	showGridMap(pts_and_pose->header.seq);
+	//showGridMap(pts_and_pose->header.seq);
 	//cout << endl << "Grid map saved!" << endl;
 }
 
@@ -696,7 +696,7 @@ void resetGridMap(const geometry_msgs::PoseArray::ConstPtr& all_kf_and_pts){
 	double ttrack = std::chrono::duration_cast<std::chrono::duration<double> >(t2 - t1).count();
 	printf("Done. Time taken: %f secs\n", ttrack);
 	pub_grid_map.publish(grid_map_msg);
-	showGridMap(all_kf_and_pts->header.seq);
+	//showGridMap(all_kf_and_pts->header.seq);
 }
 
 void getGridMap() {
